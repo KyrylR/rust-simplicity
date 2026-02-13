@@ -29,6 +29,47 @@ pub use self::tracker::{
 /// An iterator over the contents of a read or write frame which yields bits.
 pub type FrameIter<'a> = crate::BitIter<core::iter::Copied<core::slice::Iter<'a, u8>>>;
 
+fn clear_bit_range(data: &mut [u8], start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+
+    let end = start + len; // exclusive
+    let start_byte = start / 8;
+    let start_bit = start % 8;
+    let end_byte = (end - 1) / 8;
+    let end_bit = (end - 1) % 8;
+
+    if start_byte == end_byte {
+        for bit in start_bit..=end_bit {
+            data[start_byte] &= !(1 << (7 - bit));
+        }
+        return;
+    }
+
+    if start_bit > 0 {
+        for bit in start_bit..8 {
+            data[start_byte] &= !(1 << (7 - bit));
+        }
+    } else {
+        data[start_byte] = 0;
+    }
+
+    if end_byte > start_byte + 1 {
+        for byte in &mut data[(start_byte + 1)..end_byte] {
+            *byte = 0;
+        }
+    }
+
+    if end_bit < 7 {
+        for bit in 0..=end_bit {
+            data[end_byte] &= !(1 << (7 - bit));
+        }
+    } else {
+        data[end_byte] = 0;
+    }
+}
+
 /// An execution context for a Simplicity program
 pub struct BitMachine {
     /// Space for bytes that read and write frames point to.
@@ -85,6 +126,9 @@ impl BitMachine {
             self.write.len() + self.read.len() < self.read.capacity(),
             "Stacks out of bounds: number of frames"
         );
+
+        // Keep newly allocated frames clean even when boundaries are not byte-aligned.
+        clear_bit_range(&mut self.data, self.next_frame_start, len);
 
         self.write.push(Frame::new(self.next_frame_start, len));
         self.next_frame_start += len;
@@ -385,7 +429,7 @@ impl BitMachine {
                 // describes the Bit Machine "input" to the current node,
                 // no matter the node.
                 let read_iter = input_frame
-                    .map(|frame| frame.as_bit_iter(&self.data))
+                    .map(|frame| frame.as_bit_iter_from_cursor(&self.data))
                     .unwrap_or(crate::BitIter::from([].iter().copied()));
                 // See the docs on `tracker::NodeOutput` for more information about
                 // this match.

@@ -182,10 +182,20 @@ impl<'v> ValueRef<'v> {
 
     /// Convert the reference back to a value.
     pub fn to_value(&self) -> Value {
+        // Always copy to a new buffer to ensure clean padding bits.
+        // This fixes issue #337 where stale padding bits could corrupt sum tag bits
+        // when values are traversed (e.g., during scribing or pruning).
+        let bit_len = self.ty.bit_width();
+        let byte_len = bit_len.div_ceil(8);
+        let mut buf = vec![0u8; byte_len];
+        copy_bits(&self.inner, self.bit_offset, &mut buf, 0, bit_len);
+        // Zero out padding bits within the value structure (between sum tags and variant data).
+        zero_padding_bits(&mut buf, &self.ty);
+
         Value {
-            inner: Arc::clone(self.inner),
-            bit_offset: self.bit_offset,
-            ty: Arc::clone(self.ty),
+            inner: Arc::from(buf.into_boxed_slice()),
+            bit_offset: 0,
+            ty: Arc::clone(&self.ty),
         }
     }
 
@@ -273,18 +283,21 @@ impl Iterator for PreOrderIter<'_> {
 /// bit encoding and current bit offset, and returns a new bit-encoding with
 /// a new bit inserted upfront and a new bit offset.
 fn right_shift_1(inner: &Arc<[u8]>, bit_offset: usize, new_bit: bool) -> (Arc<[u8]>, usize) {
-    // If the current bit offset is nonzero this is super easy: we just
-    // lower the bit offset and call that a fix.
+    // If the current bit offset is nonzero, we lower the bit offset and
+    // explicitly set or clear the bit at the new position. This is the fix
+    // suggested by roconnor-blockstream in issue #337: always allocate and
+    // explicitly set/clear the bit to avoid stale bit corruption.
     if bit_offset > 0 {
+        let new_bit_offset = bit_offset - 1;
+        let byte_idx = new_bit_offset / 8;
+        let mut bx: Box<[u8]> = inner.as_ref().into();
+        let bit_mask = 1 << (7 - new_bit_offset % 8);
         if new_bit {
-            let new_bit_offset = bit_offset - 1;
-            let mut bx: Box<[u8]> = inner.as_ref().into();
-            bx[new_bit_offset / 8] |= 1 << (7 - new_bit_offset % 8);
-            (bx.into(), new_bit_offset)
+            bx[byte_idx] |= bit_mask;
         } else {
-            // ...and if we are inserting a 0 we don't even need to allocate a new [u8]
-            (Arc::clone(inner), bit_offset - 1)
+            bx[byte_idx] &= !bit_mask;
         }
+        (bx.into(), new_bit_offset)
     } else {
         // If the current bit offset is 0, we just shift everything right by 8
         // and then do pretty-much the same thing as above. This sometimes will
@@ -309,51 +322,58 @@ fn copy_bits(src: &[u8], src_offset: usize, dst: &mut [u8], dst_offset: usize, n
     }
 }
 
-/// Helper function to take the product of two values (i.e. their concatenation).
-///
-/// If either `left_inner` or `right_inner` is not provided, it is assumed to be
-/// padding and will be stored as all zeros.
-///
-/// Returns the new bit data and the offset (NOT the length) of the data.
+fn product_copying_aux(side: Option<(&Arc<[u8]>, usize)>, bit_length: usize) -> (Arc<[u8]>, usize) {
+    if let Some((side, bit_offset)) = side {
+        // Always copy bits to a fresh buffer to ensure any stale/garbage bits
+        // in the original buffer don't corrupt sum tag bits when the value
+        // is later wrapped in a sum type. This fixes issue #337.
+        if bit_offset == 0 {
+            // No offset, we can safely clone the Arc
+            (Arc::clone(side), 0)
+        } else {
+            // Non-zero offset: copy to ensure clean padding bits
+            let mut res = vec![0u8; bit_length.div_ceil(8)];
+            copy_bits(side, bit_offset, &mut res, 0, bit_length);
+            (Arc::from(res), 0)
+        }
+    } else {
+        (Arc::from(vec![0; bit_length.div_ceil(8)]), 0)
+    }
+}
+
 fn product(
     left: Option<(&Arc<[u8]>, usize)>,
     left_bit_length: usize,
     right: Option<(&Arc<[u8]>, usize)>,
     right_bit_length: usize,
 ) -> (Arc<[u8]>, usize) {
-    if left_bit_length == 0 {
-        if let Some((right, right_bit_offset)) = right {
-            (Arc::clone(right), right_bit_offset)
-        } else if right_bit_length == 0 {
-            (Arc::new([]), 0)
-        } else {
-            (Arc::from(vec![0; right_bit_length.div_ceil(8)]), 0)
-        }
-    } else if right_bit_length == 0 {
-        if let Some((lt, left_bit_offset)) = left {
-            (Arc::clone(lt), left_bit_offset)
-        } else {
-            (Arc::from(vec![0; left_bit_length.div_ceil(8)]), 0)
-        }
-    } else {
-        // Both left and right have nonzero lengths. This is the only "real" case
-        // in which we have to do something beyond cloning Arcs or allocating
-        // zeroed vectors. In this case we left-shift both as much as possible.
-        let mut bx = Box::<[u8]>::from(vec![0; (left_bit_length + right_bit_length).div_ceil(8)]);
-        if let Some((left, left_bit_offset)) = left {
-            copy_bits(left, left_bit_offset, &mut bx, 0, left_bit_length);
-        }
-        if let Some((right, right_bit_offset)) = right {
-            copy_bits(
-                right,
-                right_bit_offset,
-                &mut bx,
-                left_bit_length,
-                right_bit_length,
-            );
-        }
+    match (left_bit_length, right_bit_length) {
+        (0, 0) => (Arc::<[u8]>::from([]), 0),
 
-        (bx.into(), 0)
+        (0, right_bit_length) => product_copying_aux(right, right_bit_length),
+
+        (left_bit_length, 0) => product_copying_aux(left, left_bit_length),
+
+        (left_bit_length, right_bit_length) => {
+            // Both left and right have nonzero lengths. This is the only "real" case
+            // in which we have to do something beyond cloning Arcs or allocating
+            // zeroed vectors. In this case we left-shift both as much as possible.
+            let mut bx =
+                Box::<[u8]>::from(vec![0; (left_bit_length + right_bit_length).div_ceil(8)]);
+            if let Some((left, left_bit_offset)) = left {
+                copy_bits(left, left_bit_offset, &mut bx, 0, left_bit_length);
+            }
+            if let Some((right, right_bit_offset)) = right {
+                copy_bits(
+                    right,
+                    right_bit_offset,
+                    &mut bx,
+                    left_bit_length,
+                    right_bit_length,
+                );
+            }
+            (bx.into(), 0)
+        }
     }
 }
 
@@ -942,11 +962,124 @@ impl Value {
         }
         blob.push(last);
 
+        // Zero out padding bits to ensure consistent Value representation.
+        // This fixes issue #337 where stale padding bits could corrupt sum tag bits.
+        zero_padding_bits(&mut blob, ty);
+
         Ok(Value {
             inner: blob.into(),
             bit_offset: 0,
             ty: Arc::new(ty.clone()),
         })
+    }
+}
+
+/// State for the iterative padding zeroing algorithm.
+enum ZeroState<'a> {
+    ProcessType(&'a Final, usize), // (type, bit_offset)
+    ZeroSum(usize, usize),         // (padding_start, padding_end)
+    ZeroProduct(usize, usize),     // (padding_start, padding_end)
+}
+
+/// Zero a range of bits in a byte slice [start, end).
+fn zero_bit_range(data: &mut [u8], start: usize, end: usize) {
+    debug_assert!(start <= end);
+    debug_assert!(end <= data.len() * 8);
+
+    let start_byte = start / 8;
+    let end_byte = end / 8;
+    let start_bit = start % 8;
+    let end_bit = end % 8;
+
+    if start_byte == end_byte {
+        for i in start_bit..end_bit {
+            data[start_byte] &= !(1 << (7 - i));
+        }
+    } else {
+        for i in start_bit..8 {
+            data[start_byte] &= !(1 << (7 - i));
+        }
+
+        for i in (start_byte + 1)..end_byte {
+            data[i] = 0;
+        }
+
+        for i in 0..end_bit {
+            data[end_byte] &= !(1 << (7 - i));
+        }
+    }
+}
+
+/// Read a single bit from a byte slice at the given position.
+fn read_bit(data: &[u8], pos: usize) -> bool {
+    debug_assert!(pos < data.len() * 8);
+
+    let byte_idx = pos / 8;
+    let bit_idx = pos % 8;
+
+    (data[byte_idx] >> (7 - bit_idx)) & 1 == 1
+}
+
+/// Zero out all padding bits in a padded value encoding.
+///
+/// This iterates through the type structure and identifies padding regions:
+/// - For Unit types: all bits are padding
+/// - For Product types: any trailing bits after the right child are padding
+/// - For Sum types: bits between the tag and the variant data are padding
+fn zero_padding_bits(bits: &mut [u8], ty: &Final) {
+    let mut stack = vec![ZeroState::ProcessType(ty, 0)];
+
+    while let Some(state) = stack.pop() {
+        match state {
+            ZeroState::ProcessType(ty, offset) => {
+                if ty.bit_width() == 0 {
+                    continue;
+                }
+
+                match &ty.bound() {
+                    CompleteBound::Unit => {
+                        // All bits are padding
+                        zero_bit_range(bits, offset, offset + ty.bit_width());
+                    }
+
+                    CompleteBound::Product(left, right) => {
+                        let left_end = offset + left.bit_width();
+                        let right_end = left_end + right.bit_width();
+                        let product_end = offset + ty.bit_width();
+
+                        if right_end < product_end {
+                            stack.push(ZeroState::ZeroProduct(right_end, product_end));
+                        }
+
+                        if right.bit_width() > 0 {
+                            stack.push(ZeroState::ProcessType(right, left_end));
+                        }
+                        if left.bit_width() > 0 {
+                            stack.push(ZeroState::ProcessType(left, offset));
+                        }
+                    }
+
+                    CompleteBound::Sum(left, right) => {
+                        let tag = read_bit(bits, offset);
+                        let sum_end = offset + ty.bit_width();
+
+                        let variant = if !tag { left } else { right };
+                        let variants_start = sum_end - variant.bit_width();
+
+                        if offset + 1 < variants_start {
+                            stack.push(ZeroState::ZeroSum(offset + 1, variants_start));
+                        }
+                        if variant.bit_width() > 0 {
+                            stack.push(ZeroState::ProcessType(variant, variants_start));
+                        }
+                    }
+                }
+            }
+
+            ZeroState::ZeroProduct(start, end) | ZeroState::ZeroSum(start, end) => {
+                zero_bit_range(bits, start, end);
+            }
+        }
     }
 }
 

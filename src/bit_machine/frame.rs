@@ -123,6 +123,15 @@ impl Frame {
     ) -> BitIter<core::iter::Copied<core::slice::Iter<'a, u8>>> {
         BitIter::byte_slice_window(data, self.start, self.start + self.len)
     }
+
+    /// Extend the present frame with a read-only reference to the data and
+    /// return an iterator starting at the current cursor.
+    pub(super) fn as_bit_iter_from_cursor<'a>(
+        &self,
+        data: &'a [u8],
+    ) -> BitIter<core::iter::Copied<core::slice::Iter<'a, u8>>> {
+        BitIter::byte_slice_window(data, self.cursor, self.start + self.len)
+    }
 }
 
 fn get_indices(cursor: usize) -> (usize, usize) {

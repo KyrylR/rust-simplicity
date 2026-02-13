@@ -3,7 +3,6 @@
 use crate::jet::type_name::TypeName;
 use crate::jet::Jet;
 use crate::merkle::cmr::Cmr;
-use crate::decode_bits;
 use crate::{decode, BitIter, BitWriter};
 use crate::analysis::Cost;
 use hashes::sha256::Midstate;
